@@ -1,0 +1,50 @@
+# ===== 环境变量 & 密钥 =====
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+service-account.json
+
+# ===== Python 缓存 & 编译产物 =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ===== 虚拟环境 =====
+venv/
+.venv/
+env/
+.env/
+
+# ===== IDE & 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 日志文件 =====
+logs/
+*.log
+
+# ===== 用户上传文件 =====
+resource/uploads/
+
+# ===== 构建 & 分发 =====
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# ===== AI 相关 =====
+.claude/
+
+# ===== 其他 =====
+*.tmp
+*.temp
