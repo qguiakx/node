@@ -8,6 +8,9 @@ import asyncio
 import os
 import uuid
 
+import redis.asyncio as aioredis
+from langgraph.checkpoint.redis import AsyncRedisSaver
+
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +30,7 @@ from src.rag.knowlage_base import KnowledgeBaseService
 from src.utils.path_tool import get_abs_path
 from src.utils.save_chat_history import save_chat_history
 from src.config.logger_handler import logger
+from src.config import config
 
 router = APIRouter(
     prefix="/agent",
@@ -184,3 +188,122 @@ async def chat_stream(session_uuid: str = Body(..., embed=True), input_text: str
                     yield f"[工具返回] {str(tool_output)[:200]}\n"
 
     return StreamingResponse(event_generator(), media_type="text/plain")
+
+
+# ============================================================
+# 历史记录查询接口（从 Redis checkpointer 中读取）
+# ============================================================
+
+
+class HistoryRequest(BaseModel):
+    session_uuid: str
+
+
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+    additional_kwargs: dict = {}
+
+
+class HistoryResponse(BaseModel):
+    session_uuid: str
+    messages: list[HistoryMessage]
+    checkpoint_id: str | None = None
+
+
+@router.post("/history", response_model=Result[HistoryResponse])
+async def get_agent_history(request: HistoryRequest):
+    """
+    查询 Redis checkpointer 中的 Agent 对话历史。
+    从 LangGraph 的 RedisSaver 中提取指定 session 的完整消息链。
+    """
+    try:
+        client = await aioredis.from_url(
+            config.REDIS_HOST,
+            db=config.REDIS_DB,
+            decode_responses=False,
+            max_connections=50,
+        )
+
+        saver = AsyncRedisSaver(redis_client=client)
+        await saver.asetup()
+
+        config_dict = {"configurable": {"thread_id": request.session_uuid}}
+        checkpoint_tuple = await saver.aget_tuple(config_dict)
+
+        if checkpoint_tuple is None:
+            await client.aclose()
+            return Result.error(
+                message=f"未找到会话 {request.session_uuid} 的历史记录",
+                code=404
+            )
+
+        checkpoint = checkpoint_tuple.checkpoint
+        channel_values = checkpoint.get("channel_values", {})
+        raw_messages = channel_values.get("messages", [])
+
+        formatted: list[HistoryMessage] = []
+        for msg in raw_messages:
+            if hasattr(msg, "type") and hasattr(msg, "content"):
+                formatted.append(HistoryMessage(
+                    role=msg.type,
+                    content=str(msg.content),
+                    additional_kwargs=getattr(msg, "additional_kwargs", {}),
+                ))
+            elif isinstance(msg, dict):
+                formatted.append(HistoryMessage(
+                    role=msg.get("type", "unknown"),
+                    content=str(msg.get("content", "")),
+                    additional_kwargs=msg.get("additional_kwargs", {}),
+                ))
+            elif isinstance(msg, list):
+                for sub in msg:
+                    if hasattr(sub, "type"):
+                        formatted.append(HistoryMessage(
+                            role=sub.type,
+                            content=str(getattr(sub, "content", "")),
+                        ))
+
+        await client.aclose()
+
+        return Result.ok(data=HistoryResponse(
+            session_uuid=request.session_uuid,
+            messages=formatted,
+            checkpoint_id=checkpoint.get("id", None),
+        ))
+
+    except Exception as e:
+        logger.error(f"查询历史记录失败: {e}")
+        return Result.error(message=f"查询历史记录时出错: {str(e)}")
+
+
+@router.get("/history/sessions", response_model=Result[list[dict]])
+async def list_agent_sessions():
+    """
+    列出 Redis checkpointer 中所有存在的会话 thread_id。
+    扫描 Redis 中 LangGraph checkpoint 相关 key 来发现所有活跃会话。
+    """
+    try:
+        client = await aioredis.from_url(
+            config.REDIS_HOST,
+            db=config.REDIS_DB,
+            decode_responses=True,
+            max_connections=50,
+        )
+
+        session_ids: set[str] = set()
+        async for key in client.scan_iter(match="checkpoint_ns:*:checkpoint:*"):
+            parts = key.split(":")
+            if len(parts) >= 4:
+                thread_id = parts[2]
+                session_ids.add(thread_id)
+
+        await client.aclose()
+
+        return Result.ok(data=[
+            {"session_uuid": sid} for sid in sorted(session_ids)
+        ])
+
+    except Exception as e:
+        logger.error(f"列出会话列表失败: {e}")
+        return Result.error(message=f"查询会话列表时出错: {str(e)}")
